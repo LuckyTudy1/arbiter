@@ -1,0 +1,30 @@
+{
+  "name": "arbiter-chess",
+  "version": "2.0.0",
+  "description": "A chess engine written from scratch in JavaScript. ~2800 Elo, no dependencies, no neural network.",
+  "main": "arbiter-engine.js",
+  "bin": {
+    "arbiter": "./arbiter-engine.js"
+  },
+  "scripts": {
+    "test": "node test/perft.js && node test/engine.js",
+    "start": "node arbiter-engine.js"
+  },
+  "keywords": [
+    "chess",
+    "chess-engine",
+    "uci",
+    "alpha-beta",
+    "javascript"
+  ],
+  "license": "MIT",
+  "files": [
+    "arbiter-engine.js",
+    "index.html",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=14"
+  }
+}

@@ -5,7 +5,7 @@ network, no code borrowed from another engine. Roughly **2800 Elo**.
 
 It runs in a browser tab, as a command-line UCI engine, or as a library.
 
-[**Play it here**]((https://luckytudy1.github.io/arbiter/))
+[[**Play it here**]((https://luckytudy1.github.io/arbiter/))]
 
 ---
 

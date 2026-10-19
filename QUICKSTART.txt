@@ -1,0 +1,54 @@
+ARBITER 3.0 - QUICK START
+
+PLAY AND TRAIN IN A BROWSER
+Open index.html in a browser, or visit:
+https://luckytudy1.github.io/arbiter/
+
+Below the board, use Self-training lab > Start training.
+Stop keeps completed generations and discards the unfinished generation.
+Export checkpoint makes a portable backup of your progress.
+Import model / checkpoint loads weights or restores a saved checkpoint.
+Training uses this device's CPU and battery. Browser storage can be cleared;
+export important progress. If opening a local file fails, use a static host.
+
+COMMAND-LINE TRAINING
+Requires Node.js 14 or newer. No npm dependency installation is needed.
+Run these commands from the repository directory:
+
+  npm run train -- --generations 1
+  npm run train -- --continuous
+  npm run train -- --help
+
+Progress saves in .arbiter-training/checkpoint.json and resumes automatically.
+Stop with Ctrl-C; the last completed checkpoint remains available.
+Use --output another-folder for an independent run.
+
+LOAD A TRAINED MODEL IN THE UCI ENGINE
+Run: node arbiter-engine.js
+Then enter:
+
+  uci
+  setoption name EvalFile value /full/path/to/champion.json
+  isready
+  position startpos
+  go movetime 3000
+
+EvalFile accepts raw model JSON, not a full training checkpoint.
+Use "setoption name EvalFile value <none>" to restore classical evaluation.
+
+DEVELOPMENT
+After changing engine, training or lab source:
+
+  npm run build
+  npm test
+
+STRENGTH
+No pretrained weights are bundled. Candidates replace the champion only after
+passing a paired-match confidence gate, unless you explicitly import a model.
+3000+ Elo is a development goal, not an achieved or guaranteed rating.
+
+MORE INFORMATION
+README.md: overview, usage and strength measurement.
+docs/TRAINING.md: budgets, checkpoints, labels, promotion and benchmarking.
+docs/DEVELOPMENT.md: source layout, APIs, verification and release guidance.
+CHANGELOG.md: changes in version 3.0.0.

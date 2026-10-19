@@ -1,11 +1,11 @@
 #!/usr/bin/env node
 /* ============================================================
-   Arbiter 2.0 - a chess engine written from scratch.
+   Arbiter 3.0 - a chess engine written from scratch.
 
-   No external engine code, no neural network, no dependencies.
+   No external engine code or dependencies. Optional neural evaluation.
    0x88 board, alpha-beta search with transposition table,
    null-move pruning, late move reductions, static exchange
-   evaluation, quiescence search, hand-written evaluation.
+   evaluation, quiescence search, classical and trainable evaluation.
 
    UCI engine:  node arbiter-engine.js
    Library:     const E = require('./arbiter-engine.js')
@@ -13,9 +13,9 @@
    MIT licensed. See LICENSE.
    ============================================================ */
 
-function ChessCore() {
+function ChessCore(scope) {
   'use strict';
-  var G = (typeof self !== 'undefined') ? self : globalThis;
+  var G = scope || ((typeof self !== 'undefined') ? self : globalThis);
 
   var EMPTY = 0;
   var P = 1, N = 2, B = 3, R = 4, Q = 5, K = 6;
@@ -525,7 +525,7 @@ function ChessCore() {
   var wPawnAtt = new Int8Array(128);
   var bPawnAtt = new Int8Array(128);
 
-  function evaluate(pos) {
+  function evaluateClassical(pos) {
     var bd = pos.board;
     var mg = 0, eg = 0, phase = 0;
     var wPawnFiles = [0, 0, 0, 0, 0, 0, 0, 0];
@@ -739,6 +739,269 @@ function ChessCore() {
 
     score += (pos.side === WHITE ? 12 : -12); // tempo
     return pos.side === WHITE ? score : -score;
+  }
+
+  /* ===================== Trainable residual evaluation =====================
+     A shared sparse piece-square network sees the board from each colour's
+     perspective. Subtracting those outputs enforces colour/rank symmetry;
+     the classical evaluator remains the baseline, including its tempo term.
+     Models are opt-in. New models have zero output weights and therefore
+     reproduce the classical evaluation exactly until they are trained. */
+  var NETWORK_FORMAT = 'arbiter-residual-network';
+  var NETWORK_INPUTS = 768;
+  var NETWORK_SCALE = 400;
+  var NETWORK_LIMIT = 2000;
+  var activeNetwork = null;
+  var networkWhite = null, networkBlack = null;
+
+  function networkInteger(value, low, high, name) {
+    if (!Number.isSafeInteger(value) || value < low || value > high)
+      throw new Error('Invalid network ' + name);
+    return value;
+  }
+
+  function networkRandom(seed) {
+    var state = seed >>> 0;
+    if (!state) state = 0x9e3779b9;
+    return function () {
+      state ^= state << 13; state ^= state >>> 17; state ^= state << 5;
+      return (state >>> 0) / 4294967296;
+    };
+  }
+
+  function copyNetworkMetadata(meta) {
+    if (!meta || typeof meta !== 'object' || Array.isArray(meta))
+      throw new Error('Invalid network metadata');
+    return {
+      seed: networkInteger(meta.seed, 0, 4294967295, 'seed'),
+      trainingSteps: networkInteger(meta.trainingSteps, 0, Number.MAX_SAFE_INTEGER, 'trainingSteps'),
+      trainingSamples: networkInteger(meta.trainingSamples, 0, Number.MAX_SAFE_INTEGER, 'trainingSamples'),
+      epochs: networkInteger(meta.epochs, 0, Number.MAX_SAFE_INTEGER, 'epochs')
+    };
+  }
+
+  function networkWeights(values, size, name) {
+    if ((!Array.isArray(values) && !ArrayBuffer.isView(values)) || values.length !== size)
+      throw new Error('Invalid network ' + name + ' shape');
+    var result = new Float64Array(size);
+    for (var i = 0; i < size; i++) {
+      var value = values[i];
+      if (typeof value !== 'number' || !Number.isFinite(value) || Math.abs(value) > 16)
+        throw new Error('Invalid network ' + name + ' weight at ' + i);
+      result[i] = value;
+    }
+    return result;
+  }
+
+  function validateNetwork(model) {
+    if (!model || typeof model !== 'object' || Array.isArray(model) ||
+        model.format !== NETWORK_FORMAT || model.version !== 1 ||
+        model.inputs !== NETWORK_INPUTS || model.activation !== 'clipped-relu' ||
+        model.outputScale !== NETWORK_SCALE || model.maxResidual !== NETWORK_LIMIT)
+      throw new Error('Unsupported or invalid Arbiter network format');
+    var hidden = networkInteger(model.hidden, 1, 256, 'hidden size');
+    return {
+      format: NETWORK_FORMAT, version: 1, inputs: NETWORK_INPUTS, hidden: hidden,
+      activation: 'clipped-relu', outputScale: NETWORK_SCALE, maxResidual: NETWORK_LIMIT,
+      inputWeights: networkWeights(model.inputWeights, NETWORK_INPUTS * hidden, 'inputWeights'),
+      hiddenBias: networkWeights(model.hiddenBias, hidden, 'hiddenBias'),
+      outputWeights: networkWeights(model.outputWeights, hidden, 'outputWeights'),
+      metadata: copyNetworkMetadata(model.metadata)
+    };
+  }
+
+  function serializeNetwork(model) {
+    return {
+      format: model.format, version: model.version, inputs: model.inputs, hidden: model.hidden,
+      activation: model.activation, outputScale: model.outputScale, maxResidual: model.maxResidual,
+      inputWeights: Array.from(model.inputWeights), hiddenBias: Array.from(model.hiddenBias),
+      outputWeights: Array.from(model.outputWeights), metadata: copyNetworkMetadata(model.metadata)
+    };
+  }
+
+  function createNetwork(opts) {
+    opts = opts || {};
+    var hidden = networkInteger(opts.hidden === undefined ? 32 : opts.hidden, 1, 256, 'hidden size');
+    var seed = networkInteger(opts.seed === undefined ? 1 : opts.seed, 0, 4294967295, 'seed');
+    var random = networkRandom(seed);
+    var input = new Float64Array(NETWORK_INPUTS * hidden);
+    var bias = new Float64Array(hidden);
+    for (var i = 0; i < input.length; i++) input[i] = (random() - 0.5) * 0.2;
+    bias.fill(0.1);
+    return serializeNetwork({
+      format: NETWORK_FORMAT, version: 1, inputs: NETWORK_INPUTS, hidden: hidden,
+      activation: 'clipped-relu', outputScale: NETWORK_SCALE, maxResidual: NETWORK_LIMIT,
+      inputWeights: input, hiddenBias: bias, outputWeights: new Float64Array(hidden),
+      metadata: { seed: seed, trainingSteps: 0, trainingSamples: 0, epochs: 0 }
+    });
+  }
+
+  function loadNetwork(model) {
+    // Complete validation before replacing the active model or clearing search state.
+    var candidate = model === null ? null : validateNetwork(model);
+    activeNetwork = candidate;
+    networkWhite = candidate ? new Float64Array(candidate.hidden) : null;
+    networkBlack = candidate ? new Float64Array(candidate.hidden) : null;
+    clearTT();
+    return networkInfo();
+  }
+
+  function exportNetwork() { return activeNetwork ? serializeNetwork(activeNetwork) : null; }
+
+  function networkInfo() {
+    if (!activeNetwork) return { loaded: false };
+    return {
+      loaded: true, format: activeNetwork.format, version: activeNetwork.version,
+      inputs: NETWORK_INPUTS, hidden: activeNetwork.hidden,
+      parameters: NETWORK_INPUTS * activeNetwork.hidden + activeNetwork.hidden * 2,
+      metadata: copyNetworkMetadata(activeNetwork.metadata)
+    };
+  }
+
+  function featureIndex(piece, square, perspective) {
+    var relativeSquare = ((perspective === BLACK ? 7 - (square >> 4) : square >> 4) * 8) + (square & 7);
+    return ((piece & BLACK) === perspective ? 0 : 384) + ((piece & 7) - 1) * 64 + relativeSquare;
+  }
+
+  function clippedRelu(value) { return value <= 0 ? 0 : value >= 1 ? 1 : value; }
+
+  function networkForward(pos, model, white, black) {
+    var h = model.hidden, i, sq, piece, w, b;
+    white.set(model.hiddenBias); black.set(model.hiddenBias);
+    for (sq = 0; sq < 128; sq++) {
+      if (sq & 0x88) continue;
+      piece = pos.board[sq];
+      if (!piece) continue;
+      w = featureIndex(piece, sq, WHITE) * h;
+      b = featureIndex(piece, sq, BLACK) * h;
+      for (i = 0; i < h; i++) {
+        white[i] += model.inputWeights[w + i];
+        black[i] += model.inputWeights[b + i];
+      }
+    }
+    var raw = 0;
+    for (i = 0; i < h; i++) {
+      white[i] = clippedRelu(white[i]); black[i] = clippedRelu(black[i]);
+      raw += model.outputWeights[i] * (white[i] - black[i]);
+    }
+    return raw;
+  }
+
+  function evaluate(pos) {
+    var baseline = evaluateClassical(pos);
+    if (!activeNetwork) return baseline;
+    var raw = networkForward(pos, activeNetwork, networkWhite, networkBlack);
+    var residual = NETWORK_LIMIT * Math.tanh(raw * NETWORK_SCALE / NETWORK_LIMIT);
+    return baseline + (pos.side === WHITE ? residual : -residual);
+  }
+
+  function trainingPosition(fen) {
+    if (typeof fen !== 'string') throw new Error('Training sample requires a FEN string');
+    var fields = fen.trim().split(/\s+/), rows = fields[0].split('/');
+    if (fields.length < 4 || fields.length > 6 || rows.length !== 8 ||
+        !/^[wb]$/.test(fields[1]) || !/^(?:-|K?Q?k?q?)$/.test(fields[2]) ||
+        !/^(?:-|[a-h][36])$/.test(fields[3]) ||
+        (fields[4] !== undefined && (!/^\d+$/.test(fields[4]) || !Number.isSafeInteger(+fields[4]))) ||
+        (fields[5] !== undefined && (!/^[1-9]\d*$/.test(fields[5]) || !Number.isSafeInteger(+fields[5]))))
+      throw new Error('Invalid training FEN');
+    var whiteKings = 0, blackKings = 0, pieces = 0;
+    for (var r = 0; r < 8; r++) {
+      var files = 0;
+      for (var f = 0; f < rows[r].length; f++) {
+        var ch = rows[r][f];
+        if (/^[1-8]$/.test(ch)) files += +ch;
+        else if (/^[pnbrqkPNBRQK]$/.test(ch)) {
+          files++; pieces++;
+          if (ch === 'K') whiteKings++;
+          if (ch === 'k') blackKings++;
+        } else throw new Error('Invalid training FEN piece');
+      }
+      if (files !== 8) throw new Error('Invalid training FEN rank');
+    }
+    if (whiteKings !== 1 || blackKings !== 1 || pieces > 32) throw new Error('Invalid training FEN kings or piece count');
+    return new Position(fen);
+  }
+
+  function networkProbability(score) {
+    // Stable sigmoid, with scores expressed in the same centipawns as search.
+    var x = score / NETWORK_SCALE;
+    return x >= 0 ? 1 / (1 + Math.exp(-x)) : Math.exp(x) / (1 + Math.exp(x));
+  }
+
+  function trainNetwork(samples, opts) {
+    if (!activeNetwork) throw new Error('Load or create and load a network before training');
+    opts = opts || {};
+    var epochs = networkInteger(opts.epochs === undefined ? 1 : opts.epochs, 1, 10000, 'training epochs');
+    var rate = opts.learningRate === undefined ? 0.01 : opts.learningRate;
+    if (typeof rate !== 'number' || !Number.isFinite(rate) || rate <= 0 || rate > 1)
+      throw new Error('Invalid network learningRate (must be greater than 0 and at most 1)');
+    var seed = networkInteger(opts.seed === undefined ? 1 : opts.seed, 0, 4294967295, 'training seed');
+    if (!Array.isArray(samples) || !samples.length) throw new Error('Training requires at least one sample');
+    var model = activeNetwork, h = model.hidden, prepared = [], order = [];
+    var i, j, k, e;
+    // Validate the entire dataset first: a bad later sample must not partially train.
+    for (i = 0; i < samples.length; i++) {
+      var sample = samples[i];
+      if (!sample || typeof sample.target !== 'number' || !Number.isFinite(sample.target) || sample.target < 0 || sample.target > 1)
+        throw new Error('Training target must be a side-to-move probability between 0 and 1');
+      var position = trainingPosition(sample.fen), wf = [], bf = [];
+      for (j = 0; j < 128; j++) {
+        if ((j & 0x88) || !position.board[j]) continue;
+        wf.push(featureIndex(position.board[j], j, WHITE) * h);
+        bf.push(featureIndex(position.board[j], j, BLACK) * h);
+      }
+      prepared.push({ position: position, baseline: evaluateClassical(position), target: sample.target,
+        sign: position.side === WHITE ? 1 : -1, whiteFeatures: wf, blackFeatures: bf });
+      order.push(i);
+    }
+    var meta = model.metadata;
+    networkInteger(meta.trainingSteps + epochs * samples.length, 0, Number.MAX_SAFE_INTEGER, 'trainingSteps');
+    networkInteger(meta.trainingSamples + samples.length, 0, Number.MAX_SAFE_INTEGER, 'trainingSamples');
+    networkInteger(meta.epochs + epochs, 0, Number.MAX_SAFE_INTEGER, 'epochs');
+    var white = new Float64Array(h), black = new Float64Array(h);
+    function loss() {
+      var total = 0;
+      for (var n = 0; n < prepared.length; n++) {
+        var item = prepared[n];
+        var raw = networkForward(item.position, model, white, black);
+        var residual = NETWORK_LIMIT * Math.tanh(raw * NETWORK_SCALE / NETWORK_LIMIT);
+        var error = networkProbability(item.baseline + item.sign * residual) - item.target;
+        total += error * error;
+      }
+      return total / prepared.length;
+    }
+    function boundedWeight(value) { return Math.max(-16, Math.min(16, value)); }
+    var before = loss(), random = networkRandom(seed);
+    for (e = 0; e < epochs; e++) {
+      for (i = order.length - 1; i > 0; i--) {
+        j = Math.floor(random() * (i + 1));
+        var swap = order[i]; order[i] = order[j]; order[j] = swap;
+      }
+      for (i = 0; i < order.length; i++) {
+        var item = prepared[order[i]];
+        var raw = networkForward(item.position, model, white, black);
+        var bounded = Math.tanh(raw * NETWORK_SCALE / NETWORK_LIMIT);
+        var prediction = networkProbability(item.baseline + item.sign * NETWORK_LIMIT * bounded);
+        var delta = 2 * (prediction - item.target) * prediction * (1 - prediction) * item.sign * (1 - bounded * bounded);
+        for (j = 0; j < h; j++) {
+          var oldOutput = model.outputWeights[j];
+          model.outputWeights[j] = boundedWeight(oldOutput - rate * delta * (white[j] - black[j]));
+          var dw = white[j] > 0 && white[j] < 1 ? delta * oldOutput : 0;
+          var db = black[j] > 0 && black[j] < 1 ? -delta * oldOutput : 0;
+          model.hiddenBias[j] = boundedWeight(model.hiddenBias[j] - rate * (dw + db));
+          for (k = 0; k < item.whiteFeatures.length; k++) {
+            var wi = item.whiteFeatures[k] + j, bi = item.blackFeatures[k] + j;
+            model.inputWeights[wi] = boundedWeight(model.inputWeights[wi] - rate * dw);
+            model.inputWeights[bi] = boundedWeight(model.inputWeights[bi] - rate * db);
+          }
+        }
+      }
+    }
+    meta.trainingSteps += epochs * samples.length;
+    meta.trainingSamples += samples.length;
+    meta.epochs += epochs;
+    clearTT();
+    return { lossBefore: before, lossAfter: loss(), epochs: epochs, samples: samples.length };
   }
 
   /* ---------- static exchange evaluation ---------- */
@@ -979,6 +1242,10 @@ function ChessCore() {
     if (ply >= MAX_PLY) return evaluate(pos);
 
     var inChk = pos.inCheck(pos.side);
+    if (pos.half >= 100 || isRepetition(pos)) {
+      if (inChk && !pos.legalMoves().length) return -MATE + ply;
+      return 0;
+    }
     var stand = -INF;
     if (!inChk) {
       stand = evaluate(pos);
@@ -1032,7 +1299,10 @@ function ChessCore() {
     var isPV = beta - alpha > 1;
 
     if (ply > 0) {
-      if (isRepetition(pos) || pos.half >= 100) return 0;
+      if (isRepetition(pos) || pos.half >= 100) {
+        if (pos.inCheck(pos.side) && !pos.legalMoves().length) return -MATE + ply;
+        return 0;
+      }
       var mAlpha = alpha > -MATE + ply ? alpha : -MATE + ply;
       var mBeta = beta < MATE - ply - 1 ? beta : MATE - ply - 1;
       if (mAlpha >= mBeta) return mAlpha;
@@ -1196,10 +1466,7 @@ function ChessCore() {
     var t0 = Date.now();
 
     var rootMoves = pos.legalMoves();
-    if (!rootMoves.length) return { best: 0, score: 0, depth: 0, nodes: 0, time: 0, list: [] };
-    if (rootMoves.length === 1) {
-      return { best: rootMoves[0], score: 0, depth: 1, nodes: 1, time: 0, list: [{ move: rootMoves[0], score: 0 }] };
-    }
+    if (!rootMoves.length) return { best: 0, score: pos.inCheck(pos.side) ? -MATE : 0, depth: 0, nodes: 0, time: 0, list: [] };
 
     var best = rootMoves[0], bestScore = 0, completedDepth = 0;
     var list = rootMoves.map(function (m) { return { move: m, score: -INF }; });
@@ -1464,6 +1731,8 @@ function ChessCore() {
 
   G.ChessAPI = {
     Position: Position, evaluate: evaluate, think: think, chooseMove: chooseMove,
+    evaluateClassical: evaluateClassical, createNetwork: createNetwork, loadNetwork: loadNetwork,
+    exportNetwork: exportNetwork, networkInfo: networkInfo, trainNetwork: trainNetwork,
     toSAN: toSAN, gameStatus: gameStatus, clearTT: clearTT, LEVELS: LEVELS,
     parseSAN: parseSAN, bookMove: bookMove, see: see,
     mFrom: mFrom, mTo: mTo, mPromo: mPromo, mCap: mCap, mEp: mEp, mCastle: mCastle,
@@ -1488,6 +1757,12 @@ var self = globalThis;
    ============================================================ */
 
 var API = self.ChessAPI;
+API.createEngine = function () {
+  // Give training and match runners independent weights and search tables.
+  var scope = {};
+  ChessCore(scope);
+  return scope.ChessAPI;
+};
 var pos = new API.Position();
 var skill = 5;                     // 1-5, 5 = full strength
 
@@ -1557,9 +1832,10 @@ function handle(line) {
   var cmd = t[0];
 
   if (cmd === 'uci') {
-    send('id name Arbiter 2.0');
+    send('id name Arbiter 3.0');
     send('id author built from scratch, no external engine code');
     send('option name Skill type spin default 5 min 1 max 5');
+    send('option name EvalFile type string default <none>');
     send('uciok');
   }
   else if (cmd === 'isready') send('readyok');
@@ -1567,6 +1843,12 @@ function handle(line) {
   else if (cmd === 'setoption') {
     var vi = t.indexOf('value');
     if (t.indexOf('Skill') >= 0 && vi > 0) skill = Math.max(1, Math.min(5, parseInt(t[vi + 1], 10) || 5));
+    var name = t.slice(2, vi < 0 ? t.length : vi).join(' ');
+    if (name === 'EvalFile' && vi > 0) {
+      var file = t.slice(vi + 1).join(' ');
+      API.loadNetwork(file === '<none>' || file === '' ? null : JSON.parse(require('fs').readFileSync(file, 'utf8')));
+      send('info string evaluation ' + (file === '<none>' || file === '' ? 'classical' : 'loaded ' + file));
+    }
   }
   else if (cmd === 'position') {
     var movesAt = t.indexOf('moves');

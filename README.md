@@ -1,177 +1,228 @@
 # Arbiter
 
-A chess engine written from scratch in JavaScript. No dependencies, no neural
-network, no code borrowed from another engine. Roughly **2800 Elo**.
+A chess engine written from scratch in JavaScript, with an optional trainable
+neural evaluator and a self-play training platform. No runtime dependencies or
+external engine code. Runs in a browser, as a UCI engine, or as a library.
 
-It runs in a browser tab, as a command-line UCI engine, or as a library.
+[Play Arbiter](https://luckytudy1.github.io/arbiter/)
 
-## Play
+[Plain-text quick start](QUICKSTART.txt) · [Training guide](docs/TRAINING.md) ·
+[Development guide](docs/DEVELOPMENT.md) · [Changelog](CHANGELOG.md)
 
-[![Play Arbiter](https://img.shields.io/badge/Play-Arbiter-green?style=for-the-badge)](https://luckytudy1.github.io/arbiter/)
+## Play and train in your browser
 
----
+Open `index.html`, or serve it with any static host. The complete app, engine
+and trainer are embedded in this file, so it also works offline.
 
-## What's in the box
+The **Self-training lab** below the board provides:
 
-| File | What it is |
-|---|---|
-| `index.html` | The complete web app — board, rules, engine, all in one file (80 KB) |
-| `arbiter-engine.js` | The engine on its own, speaking UCI. Works with any chess GUI |
-| `test/` | The verification suite. Run it yourself |
+- **Start training / Stop**: continuously generate self-play games, train a
+  candidate network and test it against the champion in a separate Web Worker.
+- Automatic local checkpoints after each completed generation. Stopping discards
+  the unfinished generation and preserves the last checkpoint.
+- Checkpoint export/import to continue on another device or in Node, candidate
+  model export, and a reset to the classical evaluator.
 
----
+Training uses this device's CPU and battery. Browser storage can be cleared or
+fill up; export checkpoints for durable backups. If Web Workers are unavailable,
+use the command-line trainer. Some mobile file viewers restrict JavaScript;
+serving the page is more reliable than opening it from a file manager.
 
-## Playing it
+A new installation plays with the classical evaluator. Neural weights become
+active after a candidate passes the match gate, or when you explicitly import a
+model. Training and playing use separate engine instances.
 
-**In a browser.** Open `index.html`. That's the whole installation. It works
-offline and there's no server involved.
+## Train from the command line
 
-Note: on iOS, opening a downloaded HTML file from the Files app may not run
-JavaScript properly. Host it somewhere and open the link instead — GitHub Pages
-works well, and drag-and-drop hosts like Netlify Drop take about ten seconds.
+Requires Node.js 14 or newer. No package installation is needed.
 
-**In a chess GUI.** Arbiter speaks UCI, so it loads into Arena, Cute Chess,
-BanksiaGUI, or anything else that takes an engine. Those expect an executable,
-so wrap it in a two-line launcher:
+```sh
+npm run train -- --generations 1
+npm run train -- --continuous
+```
+
+The default generation uses 8 self-play games, 40 candidate/champion games,
+10 ms per move, depth at most 3 and a 240-ply cap. These are inexpensive starting
+settings for exercising the pipeline. For more useful search labels and a
+larger evaluation sample, increase the budget, for example:
+
+```sh
+npm run train -- --continuous --games 128 --arena-games 1000 \
+  --movetime 100 --depth 8 --max-plies 400 --epochs 8 --replay-size 100000
+```
+
+Use `--help` for all flags. Each generation writes to `.arbiter-training/`:
+
+| Artifact | Purpose |
+| --- | --- |
+| `checkpoint.json` | Champion, replay positions, random-stream state, generation and report |
+| `candidate.json` | Latest trained network, even if it was not promoted |
+| `champion.json` | Playing network; JSON `null` means the classical evaluator |
+| `reports/generation-N.json` | Training/held-out losses, results and uncertainty |
+
+Existing output checkpoints resume automatically. Use `--output another-folder`
+for an independent run or `--resume /path/to/arbiter-checkpoint.json` to import a
+browser checkpoint. Saved settings, replay and random-stream state are
+preserved; explicit flags override settings for the next generation. Each JSON
+file is replaced atomically; resume from `checkpoint.json`. Stop with Ctrl-C;
+the last completed generation remains available. An explicit `--resume` selects
+the input file; subsequent checkpoints are written to `--output`.
+
+### What learns
+
+The original material, piece-square, mobility, pawn structure and king-safety
+evaluation remains the foundation. A sparse **768 → 32 → 1** network learns a
+bounded correction to it using clipped ReLU hidden activations and stochastic
+gradient descent. The same weights evaluate both colour-relative board views;
+subtracting the outputs preserves rank/colour symmetry. New networks have zero
+output weights, reproducing the classical evaluation before training.
+
+Self-play starts from seeded, varied opening prefixes. Quiet positions receive
+a target combining the search's win probability and the eventual game result.
+Games stopped at the ply cap have **no invented result**: their samples use only
+the search target, and their truncation is recorded. Mate scores and positions
+without a completed search iteration are excluded from training.
+
+Replay is bounded. Training and held-out partitions are assigned by whole game
+and remain fixed as replay grows, avoiding positions from the same game leaking
+into both sets. Reports compare champion and candidate prediction losses.
+
+A candidate plays the champion from identical openings with colours reversed,
+at the same time/depth budget. Only complete game pairs count toward the score.
+An arena with any unfinished pair cannot promote a candidate. Promotion
+requires at least 40 scored games and a 95% paired confidence lower bound above
+50%. The conservative bound often needs substantially more than 40 games to
+demonstrate a small gain. A failed or inconclusive candidate leaves
+the champion in place; its candidate weights and generated positions remain
+in replay for the next generation.
+
+There are no bundled pretrained weights. Self-play can reinforce existing
+mistakes, and the neural evaluator adds search cost. Better prediction loss
+alone does not prove stronger play; the match gate measures that tradeoff.
+
+## Strength and the 3000+ Elo goal
+
+**3000+ Elo is a development target, not an achieved or guaranteed rating.**
+Adding a network and a training loop does not establish playing strength. This
+release has not been rated in an external tournament.
+
+Earlier documentation reported about 2530 from 24 fast games against
+strength-limited Stockfish, then extrapolated roughly 2800 at a longer thinking
+time. The latter was an estimate, not a measured rating at that time control.
+Those historical results have not been rerun for this version.
+
+Use the included UCI match runner to gather external evidence:
+
+```sh
+npm run match -- --opponent /path/to/stockfish --games 200 --movetime 1000 \
+  --model .arbiter-training/champion.json --out match-results.json
+```
+
+An optional `--opponent-elo 3000` sets the opponent's advertised
+`UCI_LimitStrength` / `UCI_Elo` controls. That setting is not an independently
+rated opponent. Match reports show wins/draws/losses, incomplete games, relative
+Elo and uncertainty; they do not assign Arbiter an absolute rating. Run
+`npm run match -- --help` for opening, seed, cap and timeout options.
+
+To establish 3000+, test against independently rated opponents under published
+hardware and time controls, using many balanced opening pairs and enough games
+to narrow the interval. Preserve reports, check tactical regressions, and judge
+changes by results. Stockfish is an optional opponent only; none of its code or
+weights is used by Arbiter.
+
+## UCI and library use
+
+Start the engine:
+
+```sh
+node arbiter-engine.js
+```
+
+```text
+uci
+setoption name EvalFile value /full/path/to/champion.json
+isready
+position startpos moves e2e4 e7e5
+go movetime 3000
+```
+
+`EvalFile` accepts a raw exported network or JSON `null`. Use
+`setoption name EvalFile value <none>` to restore classical evaluation. Invalid
+models are rejected before active weights change. Paths may contain spaces.
+`Skill` remains available from 1 to 5.
+
+Chess GUIs and [lichess-bot](https://github.com/lichess-bot-devs/lichess-bot)
+can launch Arbiter through a wrapper:
 
 ```sh
 #!/bin/sh
 exec node /full/path/to/arbiter-engine.js
 ```
 
-`chmod +x` that and point the GUI at it. On Windows use a `.bat` file:
+On Windows:
 
 ```bat
 @echo off
 node "%~dp0arbiter-engine.js" %*
 ```
 
-**As a Lichess bot.** Arbiter works with
-[lichess-bot](https://github.com/lichess-bot-devs/lichess-bot) out of the box.
-Point the `engine` section of its `config.yml` at the launcher script above and
-your bot is playable by anyone in the world.
-
-**From the command line.**
-
-```
-$ node arbiter-engine.js
-uci
-position startpos moves e2e4 e7e5
-go movetime 3000
-```
-
-**As a library.**
-
 ```js
+const fs = require('fs');
 const E = require('./arbiter-engine.js');
-
-const pos = new E.Position();                 // or new E.Position(fen)
+E.loadNetwork(JSON.parse(fs.readFileSync('champion.json', 'utf8')));
+const pos = new E.Position();
 const result = E.think(pos, { moveTime: 2000 });
+console.log(E.toSAN(pos, result.best), result.depth, result.score);
 
-console.log(E.toSAN(pos, result.best));       // "e4"
-console.log(result.depth, result.score);      // 12, 25
+// Independent engine instances have their own weights and search tables.
+const other = E.createEngine();
+const trainer = require('./training.js')(other);
+const generation = trainer.runGeneration(null, null, {
+  selfPlayGames: 8, arenaGames: 40, moveTime: 10, maxDepth: 3
+});
 ```
 
----
+Neural APIs: `createNetwork({ hidden, seed })`, `loadNetwork(modelOrNull)`,
+`exportNetwork()`, `networkInfo()`, `evaluateClassical(pos)`, and
+`trainNetwork([{ fen, target }], { epochs, learningRate, seed })`. Targets are
+side-to-move probabilities in `[0, 1]`; training requires a loaded network.
+Models are versioned and validated for shape, finite bounded weights and
+metadata. The serialized format is shared by Node and the browser.
 
-## Strength
+## Engine and development
 
-**~2800 Elo** at 6 seconds per move. Measured, not estimated.
+The engine uses a 0x88 board, packed moves, iterative-deepening alpha-beta,
+transposition tables, null-move pruning, late move reductions, quiescence search,
+SEE, killer/history ordering, aspiration windows and a small opening book.
+Evaluation blends middlegame and endgame terms. The network is an optional
+residual evaluator, not an incremental NNUE implementation.
 
-The method: play it against Stockfish with `UCI_LimitStrength` set to fixed
-values and find where it scores 50%. At 200 ms per move, over 24 games from a
-six-opening suite played from both colours:
+| File | Purpose |
+| --- | --- |
+| `arbiter-engine.js` | Engine, neural evaluator, model format and UCI driver |
+| `training.js` | Portable self-play, replay, training and match gate |
+| `tools/train.js` | Resumable command-line trainer |
+| `tools/match.js` | External UCI opponent measurement |
+| `web/training-ui.js` | Browser lab controls and worker lifecycle |
+| `index.html` | Complete offline playing and training app |
+| `test/` | Move generation, tactics, learning and platform checks |
+| `docs/` | Detailed training and development guides |
+| `QUICKSTART.txt` | Plain-text setup and training instructions |
+| `CHANGELOG.md` | Version 3.0.0 changes |
 
-| Opponent | Result | Score | Implied rating |
-|---|---|---|---|
-| Stockfish @ 2400 | +6 −3 =3 | 62.5% | 2489 |
-| Stockfish @ 2600 | +4 −5 =3 | 45.8% | 2571 |
+After editing engine, training or browser lab source, update the embedded page:
 
-Two brackets agreeing on **~2530 at fast time control**. Thinking time is worth
-roughly 50–70 Elo per doubling, which puts the full-strength setting near 2800.
-
-Confidence interval on 24 games is about ±150 Elo. Treat the number as a range,
-not a decimal point.
-
-**Stockfish was used only as a measuring stick.** None of its code is in this
-project, and the engine has no dependency on it. If you want a stronger engine,
-use Stockfish — it's about 3650 and freely available. Arbiter exists to be
-small, readable, and entirely self-contained.
-
----
-
-## How it works
-
-**Board.** 0x88 representation — a 16×8 array where off-board squares are
-detected with a single bitwise AND. Moves are packed into integers: origin,
-destination, promotion, captured piece, and flags for en passant, castling, and
-double pawn pushes.
-
-**Search.** Iterative deepening alpha-beta with:
-
-- Transposition table (2M entries, two buckets, Zobrist hashed)
-- Null-move pruning
-- Late move reductions on a logarithmic schedule
-- Futility pruning, reverse futility, razoring, late move pruning
-- Static exchange evaluation for move ordering and pruning losing captures
-- Killer moves, counter-moves, butterfly history
-- Quiescence search with delta pruning
-- Aspiration windows
-- Check extensions, mate distance pruning
-
-**Evaluation.** Tapered between middlegame and endgame by material phase:
-
-- Material and piece-square tables
-- Mobility, counted excluding squares attacked by enemy pawns
-- King danger from weighted attacker counts, plus pawn shield and open files
-- Passed, isolated, doubled and defended pawns; passers weighted by king distance
-- Knight and bishop outposts, rooks on open files and the seventh rank
-- Bishop pair, tempo, drawish-endgame scaling, lone-king mate driving
-
-**Opening book.** 38 mainline openings, replayed at load time into a position
-table, with weighted random selection for variety.
-
-Depth reached is typically 9–15 in two seconds, and considerably more in
-simplified endgames.
-
----
-
-## Testing
-
-```
+```sh
+npm run build
 npm test
 ```
 
-Or individually:
-
-```
-node test/perft.js      # move generator: 26 checks, ~11M nodes
-node test/engine.js     # evaluation, SEE, SAN, tactics
-```
-
-`perft.js` counts every legal move sequence to a fixed depth from six positions
-chosen to exercise castling, en passant, promotion and pins, and compares against
-the standard reference counts. If the move generator is wrong anywhere, this
-catches it.
-
-`engine.js` checks that evaluation is exactly symmetric when the board is
-mirrored and colours swapped, that static exchange evaluation matches a
-brute-force capture search, that move notation round-trips through the parser,
-and that the search finds known tactics.
-
----
-
-## Contributing
-
-The interesting work is in evaluation tuning — the weights are hand-chosen and
-almost certainly leave 100+ Elo on the table. If you change something, prove it
-with games rather than intuition; at this level a real improvement is worth 5–20
-Elo and is invisible in fewer than a few hundred games.
-
-Keep `npm test` passing.
-
----
+The suite checks the browser embedding is current, standard perft counts,
+evaluation symmetry, SEE, SAN, tactics, neural learning/serialization/validation,
+replay partitions, truncation, promotion statistics, UCI handling and checkpoint
+resume. Training/search label regressions include forced-move scores and
+checkmate taking precedence over the fifty-move draw rule.
 
 ## Licence
 
-MIT. Do whatever you like with it.
+MIT. See `LICENSE`.

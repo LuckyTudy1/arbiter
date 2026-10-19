@@ -274,9 +274,10 @@ h1 span{color:var(--chalk)}
 <div class="toast" id="toast"></div>
 
 <script>
-function ChessCore() {
+// BEGIN GENERATED ENGINE
+function ChessCore(scope) {
   'use strict';
-  var G = (typeof self !== 'undefined') ? self : globalThis;
+  var G = scope || ((typeof self !== 'undefined') ? self : globalThis);
 
   var EMPTY = 0;
   var P = 1, N = 2, B = 3, R = 4, Q = 5, K = 6;
@@ -786,7 +787,7 @@ function ChessCore() {
   var wPawnAtt = new Int8Array(128);
   var bPawnAtt = new Int8Array(128);
 
-  function evaluate(pos) {
+  function evaluateClassical(pos) {
     var bd = pos.board;
     var mg = 0, eg = 0, phase = 0;
     var wPawnFiles = [0, 0, 0, 0, 0, 0, 0, 0];
@@ -1000,6 +1001,269 @@ function ChessCore() {
 
     score += (pos.side === WHITE ? 12 : -12); // tempo
     return pos.side === WHITE ? score : -score;
+  }
+
+  /* ===================== Trainable residual evaluation =====================
+     A shared sparse piece-square network sees the board from each colour's
+     perspective. Subtracting those outputs enforces colour/rank symmetry;
+     the classical evaluator remains the baseline, including its tempo term.
+     Models are opt-in. New models have zero output weights and therefore
+     reproduce the classical evaluation exactly until they are trained. */
+  var NETWORK_FORMAT = 'arbiter-residual-network';
+  var NETWORK_INPUTS = 768;
+  var NETWORK_SCALE = 400;
+  var NETWORK_LIMIT = 2000;
+  var activeNetwork = null;
+  var networkWhite = null, networkBlack = null;
+
+  function networkInteger(value, low, high, name) {
+    if (!Number.isSafeInteger(value) || value < low || value > high)
+      throw new Error('Invalid network ' + name);
+    return value;
+  }
+
+  function networkRandom(seed) {
+    var state = seed >>> 0;
+    if (!state) state = 0x9e3779b9;
+    return function () {
+      state ^= state << 13; state ^= state >>> 17; state ^= state << 5;
+      return (state >>> 0) / 4294967296;
+    };
+  }
+
+  function copyNetworkMetadata(meta) {
+    if (!meta || typeof meta !== 'object' || Array.isArray(meta))
+      throw new Error('Invalid network metadata');
+    return {
+      seed: networkInteger(meta.seed, 0, 4294967295, 'seed'),
+      trainingSteps: networkInteger(meta.trainingSteps, 0, Number.MAX_SAFE_INTEGER, 'trainingSteps'),
+      trainingSamples: networkInteger(meta.trainingSamples, 0, Number.MAX_SAFE_INTEGER, 'trainingSamples'),
+      epochs: networkInteger(meta.epochs, 0, Number.MAX_SAFE_INTEGER, 'epochs')
+    };
+  }
+
+  function networkWeights(values, size, name) {
+    if ((!Array.isArray(values) && !ArrayBuffer.isView(values)) || values.length !== size)
+      throw new Error('Invalid network ' + name + ' shape');
+    var result = new Float64Array(size);
+    for (var i = 0; i < size; i++) {
+      var value = values[i];
+      if (typeof value !== 'number' || !Number.isFinite(value) || Math.abs(value) > 16)
+        throw new Error('Invalid network ' + name + ' weight at ' + i);
+      result[i] = value;
+    }
+    return result;
+  }
+
+  function validateNetwork(model) {
+    if (!model || typeof model !== 'object' || Array.isArray(model) ||
+        model.format !== NETWORK_FORMAT || model.version !== 1 ||
+        model.inputs !== NETWORK_INPUTS || model.activation !== 'clipped-relu' ||
+        model.outputScale !== NETWORK_SCALE || model.maxResidual !== NETWORK_LIMIT)
+      throw new Error('Unsupported or invalid Arbiter network format');
+    var hidden = networkInteger(model.hidden, 1, 256, 'hidden size');
+    return {
+      format: NETWORK_FORMAT, version: 1, inputs: NETWORK_INPUTS, hidden: hidden,
+      activation: 'clipped-relu', outputScale: NETWORK_SCALE, maxResidual: NETWORK_LIMIT,
+      inputWeights: networkWeights(model.inputWeights, NETWORK_INPUTS * hidden, 'inputWeights'),
+      hiddenBias: networkWeights(model.hiddenBias, hidden, 'hiddenBias'),
+      outputWeights: networkWeights(model.outputWeights, hidden, 'outputWeights'),
+      metadata: copyNetworkMetadata(model.metadata)
+    };
+  }
+
+  function serializeNetwork(model) {
+    return {
+      format: model.format, version: model.version, inputs: model.inputs, hidden: model.hidden,
+      activation: model.activation, outputScale: model.outputScale, maxResidual: model.maxResidual,
+      inputWeights: Array.from(model.inputWeights), hiddenBias: Array.from(model.hiddenBias),
+      outputWeights: Array.from(model.outputWeights), metadata: copyNetworkMetadata(model.metadata)
+    };
+  }
+
+  function createNetwork(opts) {
+    opts = opts || {};
+    var hidden = networkInteger(opts.hidden === undefined ? 32 : opts.hidden, 1, 256, 'hidden size');
+    var seed = networkInteger(opts.seed === undefined ? 1 : opts.seed, 0, 4294967295, 'seed');
+    var random = networkRandom(seed);
+    var input = new Float64Array(NETWORK_INPUTS * hidden);
+    var bias = new Float64Array(hidden);
+    for (var i = 0; i < input.length; i++) input[i] = (random() - 0.5) * 0.2;
+    bias.fill(0.1);
+    return serializeNetwork({
+      format: NETWORK_FORMAT, version: 1, inputs: NETWORK_INPUTS, hidden: hidden,
+      activation: 'clipped-relu', outputScale: NETWORK_SCALE, maxResidual: NETWORK_LIMIT,
+      inputWeights: input, hiddenBias: bias, outputWeights: new Float64Array(hidden),
+      metadata: { seed: seed, trainingSteps: 0, trainingSamples: 0, epochs: 0 }
+    });
+  }
+
+  function loadNetwork(model) {
+    // Complete validation before replacing the active model or clearing search state.
+    var candidate = model === null ? null : validateNetwork(model);
+    activeNetwork = candidate;
+    networkWhite = candidate ? new Float64Array(candidate.hidden) : null;
+    networkBlack = candidate ? new Float64Array(candidate.hidden) : null;
+    clearTT();
+    return networkInfo();
+  }
+
+  function exportNetwork() { return activeNetwork ? serializeNetwork(activeNetwork) : null; }
+
+  function networkInfo() {
+    if (!activeNetwork) return { loaded: false };
+    return {
+      loaded: true, format: activeNetwork.format, version: activeNetwork.version,
+      inputs: NETWORK_INPUTS, hidden: activeNetwork.hidden,
+      parameters: NETWORK_INPUTS * activeNetwork.hidden + activeNetwork.hidden * 2,
+      metadata: copyNetworkMetadata(activeNetwork.metadata)
+    };
+  }
+
+  function featureIndex(piece, square, perspective) {
+    var relativeSquare = ((perspective === BLACK ? 7 - (square >> 4) : square >> 4) * 8) + (square & 7);
+    return ((piece & BLACK) === perspective ? 0 : 384) + ((piece & 7) - 1) * 64 + relativeSquare;
+  }
+
+  function clippedRelu(value) { return value <= 0 ? 0 : value >= 1 ? 1 : value; }
+
+  function networkForward(pos, model, white, black) {
+    var h = model.hidden, i, sq, piece, w, b;
+    white.set(model.hiddenBias); black.set(model.hiddenBias);
+    for (sq = 0; sq < 128; sq++) {
+      if (sq & 0x88) continue;
+      piece = pos.board[sq];
+      if (!piece) continue;
+      w = featureIndex(piece, sq, WHITE) * h;
+      b = featureIndex(piece, sq, BLACK) * h;
+      for (i = 0; i < h; i++) {
+        white[i] += model.inputWeights[w + i];
+        black[i] += model.inputWeights[b + i];
+      }
+    }
+    var raw = 0;
+    for (i = 0; i < h; i++) {
+      white[i] = clippedRelu(white[i]); black[i] = clippedRelu(black[i]);
+      raw += model.outputWeights[i] * (white[i] - black[i]);
+    }
+    return raw;
+  }
+
+  function evaluate(pos) {
+    var baseline = evaluateClassical(pos);
+    if (!activeNetwork) return baseline;
+    var raw = networkForward(pos, activeNetwork, networkWhite, networkBlack);
+    var residual = NETWORK_LIMIT * Math.tanh(raw * NETWORK_SCALE / NETWORK_LIMIT);
+    return baseline + (pos.side === WHITE ? residual : -residual);
+  }
+
+  function trainingPosition(fen) {
+    if (typeof fen !== 'string') throw new Error('Training sample requires a FEN string');
+    var fields = fen.trim().split(/\s+/), rows = fields[0].split('/');
+    if (fields.length < 4 || fields.length > 6 || rows.length !== 8 ||
+        !/^[wb]$/.test(fields[1]) || !/^(?:-|K?Q?k?q?)$/.test(fields[2]) ||
+        !/^(?:-|[a-h][36])$/.test(fields[3]) ||
+        (fields[4] !== undefined && (!/^\d+$/.test(fields[4]) || !Number.isSafeInteger(+fields[4]))) ||
+        (fields[5] !== undefined && (!/^[1-9]\d*$/.test(fields[5]) || !Number.isSafeInteger(+fields[5]))))
+      throw new Error('Invalid training FEN');
+    var whiteKings = 0, blackKings = 0, pieces = 0;
+    for (var r = 0; r < 8; r++) {
+      var files = 0;
+      for (var f = 0; f < rows[r].length; f++) {
+        var ch = rows[r][f];
+        if (/^[1-8]$/.test(ch)) files += +ch;
+        else if (/^[pnbrqkPNBRQK]$/.test(ch)) {
+          files++; pieces++;
+          if (ch === 'K') whiteKings++;
+          if (ch === 'k') blackKings++;
+        } else throw new Error('Invalid training FEN piece');
+      }
+      if (files !== 8) throw new Error('Invalid training FEN rank');
+    }
+    if (whiteKings !== 1 || blackKings !== 1 || pieces > 32) throw new Error('Invalid training FEN kings or piece count');
+    return new Position(fen);
+  }
+
+  function networkProbability(score) {
+    // Stable sigmoid, with scores expressed in the same centipawns as search.
+    var x = score / NETWORK_SCALE;
+    return x >= 0 ? 1 / (1 + Math.exp(-x)) : Math.exp(x) / (1 + Math.exp(x));
+  }
+
+  function trainNetwork(samples, opts) {
+    if (!activeNetwork) throw new Error('Load or create and load a network before training');
+    opts = opts || {};
+    var epochs = networkInteger(opts.epochs === undefined ? 1 : opts.epochs, 1, 10000, 'training epochs');
+    var rate = opts.learningRate === undefined ? 0.01 : opts.learningRate;
+    if (typeof rate !== 'number' || !Number.isFinite(rate) || rate <= 0 || rate > 1)
+      throw new Error('Invalid network learningRate (must be greater than 0 and at most 1)');
+    var seed = networkInteger(opts.seed === undefined ? 1 : opts.seed, 0, 4294967295, 'training seed');
+    if (!Array.isArray(samples) || !samples.length) throw new Error('Training requires at least one sample');
+    var model = activeNetwork, h = model.hidden, prepared = [], order = [];
+    var i, j, k, e;
+    // Validate the entire dataset first: a bad later sample must not partially train.
+    for (i = 0; i < samples.length; i++) {
+      var sample = samples[i];
+      if (!sample || typeof sample.target !== 'number' || !Number.isFinite(sample.target) || sample.target < 0 || sample.target > 1)
+        throw new Error('Training target must be a side-to-move probability between 0 and 1');
+      var position = trainingPosition(sample.fen), wf = [], bf = [];
+      for (j = 0; j < 128; j++) {
+        if ((j & 0x88) || !position.board[j]) continue;
+        wf.push(featureIndex(position.board[j], j, WHITE) * h);
+        bf.push(featureIndex(position.board[j], j, BLACK) * h);
+      }
+      prepared.push({ position: position, baseline: evaluateClassical(position), target: sample.target,
+        sign: position.side === WHITE ? 1 : -1, whiteFeatures: wf, blackFeatures: bf });
+      order.push(i);
+    }
+    var meta = model.metadata;
+    networkInteger(meta.trainingSteps + epochs * samples.length, 0, Number.MAX_SAFE_INTEGER, 'trainingSteps');
+    networkInteger(meta.trainingSamples + samples.length, 0, Number.MAX_SAFE_INTEGER, 'trainingSamples');
+    networkInteger(meta.epochs + epochs, 0, Number.MAX_SAFE_INTEGER, 'epochs');
+    var white = new Float64Array(h), black = new Float64Array(h);
+    function loss() {
+      var total = 0;
+      for (var n = 0; n < prepared.length; n++) {
+        var item = prepared[n];
+        var raw = networkForward(item.position, model, white, black);
+        var residual = NETWORK_LIMIT * Math.tanh(raw * NETWORK_SCALE / NETWORK_LIMIT);
+        var error = networkProbability(item.baseline + item.sign * residual) - item.target;
+        total += error * error;
+      }
+      return total / prepared.length;
+    }
+    function boundedWeight(value) { return Math.max(-16, Math.min(16, value)); }
+    var before = loss(), random = networkRandom(seed);
+    for (e = 0; e < epochs; e++) {
+      for (i = order.length - 1; i > 0; i--) {
+        j = Math.floor(random() * (i + 1));
+        var swap = order[i]; order[i] = order[j]; order[j] = swap;
+      }
+      for (i = 0; i < order.length; i++) {
+        var item = prepared[order[i]];
+        var raw = networkForward(item.position, model, white, black);
+        var bounded = Math.tanh(raw * NETWORK_SCALE / NETWORK_LIMIT);
+        var prediction = networkProbability(item.baseline + item.sign * NETWORK_LIMIT * bounded);
+        var delta = 2 * (prediction - item.target) * prediction * (1 - prediction) * item.sign * (1 - bounded * bounded);
+        for (j = 0; j < h; j++) {
+          var oldOutput = model.outputWeights[j];
+          model.outputWeights[j] = boundedWeight(oldOutput - rate * delta * (white[j] - black[j]));
+          var dw = white[j] > 0 && white[j] < 1 ? delta * oldOutput : 0;
+          var db = black[j] > 0 && black[j] < 1 ? -delta * oldOutput : 0;
+          model.hiddenBias[j] = boundedWeight(model.hiddenBias[j] - rate * (dw + db));
+          for (k = 0; k < item.whiteFeatures.length; k++) {
+            var wi = item.whiteFeatures[k] + j, bi = item.blackFeatures[k] + j;
+            model.inputWeights[wi] = boundedWeight(model.inputWeights[wi] - rate * dw);
+            model.inputWeights[bi] = boundedWeight(model.inputWeights[bi] - rate * db);
+          }
+        }
+      }
+    }
+    meta.trainingSteps += epochs * samples.length;
+    meta.trainingSamples += samples.length;
+    meta.epochs += epochs;
+    clearTT();
+    return { lossBefore: before, lossAfter: loss(), epochs: epochs, samples: samples.length };
   }
 
   /* ---------- static exchange evaluation ---------- */
@@ -1240,6 +1504,10 @@ function ChessCore() {
     if (ply >= MAX_PLY) return evaluate(pos);
 
     var inChk = pos.inCheck(pos.side);
+    if (pos.half >= 100 || isRepetition(pos)) {
+      if (inChk && !pos.legalMoves().length) return -MATE + ply;
+      return 0;
+    }
     var stand = -INF;
     if (!inChk) {
       stand = evaluate(pos);
@@ -1293,7 +1561,10 @@ function ChessCore() {
     var isPV = beta - alpha > 1;
 
     if (ply > 0) {
-      if (isRepetition(pos) || pos.half >= 100) return 0;
+      if (isRepetition(pos) || pos.half >= 100) {
+        if (pos.inCheck(pos.side) && !pos.legalMoves().length) return -MATE + ply;
+        return 0;
+      }
       var mAlpha = alpha > -MATE + ply ? alpha : -MATE + ply;
       var mBeta = beta < MATE - ply - 1 ? beta : MATE - ply - 1;
       if (mAlpha >= mBeta) return mAlpha;
@@ -1457,10 +1728,7 @@ function ChessCore() {
     var t0 = Date.now();
 
     var rootMoves = pos.legalMoves();
-    if (!rootMoves.length) return { best: 0, score: 0, depth: 0, nodes: 0, time: 0, list: [] };
-    if (rootMoves.length === 1) {
-      return { best: rootMoves[0], score: 0, depth: 1, nodes: 1, time: 0, list: [{ move: rootMoves[0], score: 0 }] };
-    }
+    if (!rootMoves.length) return { best: 0, score: pos.inCheck(pos.side) ? -MATE : 0, depth: 0, nodes: 0, time: 0, list: [] };
 
     var best = rootMoves[0], bestScore = 0, completedDepth = 0;
     var list = rootMoves.map(function (m) { return { move: m, score: -INF }; });
@@ -1725,6 +1993,8 @@ function ChessCore() {
 
   G.ChessAPI = {
     Position: Position, evaluate: evaluate, think: think, chooseMove: chooseMove,
+    evaluateClassical: evaluateClassical, createNetwork: createNetwork, loadNetwork: loadNetwork,
+    exportNetwork: exportNetwork, networkInfo: networkInfo, trainNetwork: trainNetwork,
     toSAN: toSAN, gameStatus: gameStatus, clearTT: clearTT, LEVELS: LEVELS,
     parseSAN: parseSAN, bookMove: bookMove, see: see,
     mFrom: mFrom, mTo: mTo, mPromo: mPromo, mCap: mCap, mEp: mEp, mCastle: mCastle,
@@ -1736,7 +2006,377 @@ function ChessCore() {
 }
 
 
+function LearningCore(E) {
+  'use strict';
+  if (!E || typeof E.think !== 'function') throw new Error('A ChessCore engine is required');
+
+  var VERSION = 1, SCORE_SCALE = 400, PROMOTION_MIN_GAMES = 40;
+  var OPENINGS = [
+    'e4 e5 Nf3 Nc6 Bb5 a6 Ba4 Nf6 O-O Be7',
+    'e4 e5 Nf3 Nc6 Bc4 Bc5 c3 Nf6 d3 d6',
+    'e4 e5 Nf3 Nc6 d4 exd4 Nxd4 Nf6 Nc3 Bb4',
+    'e4 c5 Nf3 d6 d4 cxd4 Nxd4 Nf6 Nc3 a6',
+    'e4 c5 Nf3 Nc6 d4 cxd4 Nxd4 g6 Nc3 Bg7',
+    'e4 e6 d4 d5 Nc3 Nf6 Bg5 Be7 e5 Nfd7',
+    'e4 c6 d4 d5 Nc3 dxe4 Nxe4 Bf5 Ng3 Bg6',
+    'd4 d5 c4 e6 Nc3 Nf6 Bg5 Be7 e3 O-O',
+    'd4 d5 c4 c6 Nf3 Nf6 Nc3 dxc4 a4 Bf5',
+    'd4 Nf6 c4 g6 Nc3 Bg7 e4 d6 Nf3 O-O',
+    'd4 Nf6 c4 g6 Nc3 d5 cxd5 Nxd5 e4 Nxc3',
+    'd4 Nf6 c4 e6 Nc3 Bb4 e3 O-O Bd3 d5',
+    'd4 Nf6 c4 e6 Nf3 b6 g3 Bb7 Bg2 Be7',
+    'c4 e5 Nc3 Nf6 Nf3 Nc6 g3 Bb4 Bg2 O-O',
+    'Nf3 d5 g3 Nf6 Bg2 e6 O-O Be7 d3 O-O',
+    'd4 d5 Nf3 Nf6 Bf4 e6 e3 Bd6 Bg3 O-O',
+    'e4 d5 exd5 Qxd5 Nc3 Qa5 d4 Nf6 Nf3 c6',
+    'e4 Nf6 e5 Nd5 d4 d6 Nf3 Bg4 Be2 e6',
+    'e4 d6 d4 Nf6 Nc3 g6 Nf3 Bg7 Be2 O-O',
+    'd4 f5 g3 Nf6 Bg2 g6 Nf3 Bg7 O-O O-O'
+  ];
+
+  function copy(value) { return value == null ? null : JSON.parse(JSON.stringify(value)); }
+  function integer(value, fallback, min, max) {
+    if (value === undefined || value === null) return fallback;
+    if (!Number.isFinite(value) || Math.floor(value) !== value || value < min || value > max)
+      throw new Error('Expected an integer between ' + min + ' and ' + max);
+    return value;
+  }
+  function number(value, fallback, min, max) {
+    if (value === undefined || value === null) return fallback;
+    if (!Number.isFinite(value) || value < min || value > max)
+      throw new Error('Expected a number between ' + min + ' and ' + max);
+    return value;
+  }
+  function seedNumber(seed) {
+    if (seed == null) return 1;
+    if (typeof seed === 'number' && Number.isFinite(seed)) return seed >>> 0;
+    var str = String(seed == null ? 1 : seed), h = 2166136261;
+    for (var i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 16777619); }
+    return h >>> 0;
+  }
+  function createRNG(seed) {
+    var state = seedNumber(seed);
+    return {
+      next: function () {
+        state = (state + 0x6D2B79F5) >>> 0;
+        var t = state;
+        t = Math.imul(t ^ (t >>> 15), t | 1);
+        t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+      },
+      state: function () { return state; }
+    };
+  }
+  function probability(score) { return 1 / (1 + Math.exp(-Math.max(-16000, Math.min(16000, score)) / SCORE_SCALE)); }
+  // ChessCore invalidates its transposition table when loading an evaluator.
+  function setModel(model) { E.loadNetwork(model == null ? null : model); }
+  function notify(callback, value) { if (typeof callback === 'function') callback(value); }
+
+  function options(opts) {
+    opts = opts || {};
+    var cfg = {
+      seed: seedNumber(opts.seed),
+      selfPlayGames: integer(opts.selfPlayGames, 8, 1, 100000),
+      arenaGames: integer(opts.arenaGames, 40, 2, 100000),
+      minArenaGames: Math.max(PROMOTION_MIN_GAMES, integer(opts.minArenaGames, PROMOTION_MIN_GAMES, 2, 100000)),
+      maxPlies: integer(opts.maxPlies, 160, 1, 10000),
+      moveTime: number(opts.moveTime, 10, 1, 3600000),
+      maxDepth: integer(opts.maxDepth, 3, 1, 64),
+      openingPlies: integer(opts.openingPlies, 8, 0, 20),
+      sampleEvery: integer(opts.sampleEvery, 2, 1, 10000),
+      sampleStartPly: integer(opts.sampleStartPly, 8, 0, 10000),
+      resultWeight: number(opts.resultWeight, 0.5, 0, 1),
+      heldoutFraction: number(opts.heldoutFraction, 0.2, 0.01, 0.5),
+      maxReplay: integer(opts.maxReplay, 20000, 2, 1000000),
+      hidden: integer(opts.hidden, 32, 1, 256),
+      epochs: integer(opts.epochs, 3, 1, 10000),
+      learningRate: number(opts.learningRate, 0.01, 0.000001, 1),
+      confidence: number(opts.confidence, 0.95, 0.8, 0.9999),
+      generation: integer(opts.generation, 1, 1, Number.MAX_SAFE_INTEGER),
+      nextGameId: integer(opts.nextGameId, 0, 0, Number.MAX_SAFE_INTEGER),
+      openingFens: Array.isArray(opts.openingFens) ? opts.openingFens.slice() : null,
+      rngState: opts.rngState == null ? null : integer(opts.rngState, 0, 0, 4294967295)
+    };
+    if (cfg.arenaGames % 2) throw new Error('arenaGames must be even for paired-color testing');
+    return cfg;
+  }
+
+  function modelSignature(model) {
+    var json = JSON.stringify(model == null ? null : model), hashes = [2166136261, 2246822519, 3266489917, 668265263];
+    for (var i = 0; i < json.length; i++) {
+      var code = json.charCodeAt(i);
+      for (var j = 0; j < hashes.length; j++) hashes[j] = Math.imul(hashes[j] ^ code, 16777619 + j * 2) >>> 0;
+    }
+    return json.length + ':' + hashes.map(function (hash) { return hash.toString(16); }).join(':');
+  }
+
+  function opening(rng, cfg, pairIndex) {
+    var pos, index, moves = [];
+    if (cfg.openingFens && cfg.openingFens.length) {
+      index = Math.floor(rng.next() * cfg.openingFens.length);
+      pos = new E.Position(cfg.openingFens[index]);
+    } else {
+      index = Math.floor(rng.next() * OPENINGS.length);
+      pos = new E.Position();
+      var line = OPENINGS[index].split(' ');
+      var length = Math.min(cfg.openingPlies, line.length, Math.max(0, cfg.maxPlies - 1));
+      // Vary the prefix as well as the line, while reusing it exactly for a pair.
+      if (length > 4) length = 4 + Math.floor(rng.next() * (length - 3));
+      for (var i = 0; i < length; i++) {
+        var move = E.parseSAN(pos, line[i]);
+        if (!move) throw new Error('Invalid training opening: ' + line.slice(0, i + 1).join(' '));
+        pos.makeMove(move);
+        moves.push(line[i]);
+      }
+    }
+    return { index: index, pair: pairIndex == null ? null : pairIndex, san: moves, fen: pos.fen() };
+  }
+  function openingPosition(start) {
+    if (!start.san.length) return new E.Position(start.fen);
+    var pos = new E.Position();
+    start.san.forEach(function (san) { pos.makeMove(E.parseSAN(pos, san)); });
+    return pos;
+  }
+
+  function actualScore(result, color) {
+    if (result === '1/2-1/2') return 0.5;
+    if (result === '1-0') return color === E.WHITE ? 1 : 0;
+    if (result === '0-1') return color === E.BLACK ? 1 : 0;
+    return null;
+  }
+
+  function generateSelfPlay(model, opts, onProgress) {
+    var cfg = options(opts), rng = createRNG(cfg.rngState == null ? cfg.seed : cfg.rngState);
+    var samples = [], games = [], heldoutCount = cfg.selfPlayGames > 1 ? Math.max(1, Math.floor(cfg.selfPlayGames * cfg.heldoutFraction)) : 0;
+    var partitions = [], i;
+    for (i = 0; i < cfg.selfPlayGames; i++) partitions.push(i < heldoutCount ? 'heldout' : 'train');
+    for (i = partitions.length - 1; i > 0; i--) {
+      var j = Math.floor(rng.next() * (i + 1)), swap = partitions[i];
+      partitions[i] = partitions[j]; partitions[j] = swap;
+    }
+    setModel(model);
+    for (var g = 0; g < cfg.selfPlayGames; g++) {
+      var start = opening(rng, cfg), pos = openingPosition(start), observations = [];
+      var id = 'g' + cfg.generation + '-' + (cfg.nextGameId + g);
+      var ply = start.san.length, status = E.gameStatus(pos);
+      E.clearTT();
+      while (!status.over && ply < cfg.maxPlies) {
+        var search = E.think(pos, { moveTime: cfg.moveTime, maxDepth: cfg.maxDepth });
+        if (!search.best) throw new Error('Search did not return a legal self-play move');
+        var quiet = !pos.inCheck(pos.side) && !E.mCap(search.best) && !E.mEp(search.best) && !E.mPromo(search.best);
+        if (quiet && search.depth > 0 && Number.isFinite(search.score) && Math.abs(search.score) < E.MATE - 1000 && ply >= cfg.sampleStartPly && (ply - cfg.sampleStartPly) % cfg.sampleEvery === 0) {
+          observations.push({ gameId: id, fen: pos.fen(), side: pos.side, ply: ply, searchTarget: probability(search.score), partition: partitions[g] });
+        }
+        pos.makeMove(search.best);
+        ply++;
+        status = E.gameStatus(pos);
+        if (ply % 32 === 0) notify(onProgress, { phase: 'selfplay', game: g + 1, games: cfg.selfPlayGames, ply: ply, samples: samples.length + observations.length });
+      }
+      var truncated = !status.over, result = status.over ? status.result : null;
+      observations.forEach(function (sample) {
+        sample.resultTarget = truncated ? null : actualScore(result, sample.side);
+        sample.target = truncated ? sample.searchTarget : (1 - cfg.resultWeight) * sample.searchTarget + cfg.resultWeight * sample.resultTarget;
+        sample.truncated = truncated;
+        sample.source = truncated ? 'search-bootstrap' : 'search-and-result';
+        delete sample.side;
+        samples.push(sample);
+      });
+      games.push({ id: id, opening: start, plies: ply, result: result, reason: truncated ? 'ply-cap' : status.reason, truncated: truncated, samples: observations.length, partition: partitions[g] });
+      notify(onProgress, { phase: 'selfplay', game: g + 1, games: cfg.selfPlayGames, ply: ply, result: result, truncated: truncated, samples: samples.length });
+    }
+    return { games: games, samples: samples, nextGameId: cfg.nextGameId + cfg.selfPlayGames, rngState: rng.state() };
+  }
+
+  function validSample(sample) {
+    return sample && typeof sample.gameId === 'string' && sample.gameId.length > 0 && typeof sample.fen === 'string' && Number.isFinite(sample.target) && sample.target >= 0 && sample.target <= 1;
+  }
+  function splitByGame(samples, fraction, seed) {
+    fraction = number(fraction, 0.2, 0.01, 0.5);
+    var groups = Object.create(null), train = [], heldout = [], trainGames = [], heldoutGames = [];
+    samples.forEach(function (sample) {
+      if (!validSample(sample)) throw new Error('Invalid replay sample');
+      var group = groups[sample.gameId] || (groups[sample.gameId] = { samples: [], partition: null });
+      if (sample.partition === 'train' || sample.partition === 'heldout') {
+        if (group.partition && group.partition !== sample.partition) throw new Error('A game cannot appear in both replay partitions');
+        group.partition = sample.partition;
+      }
+      group.samples.push(sample);
+    });
+    Object.keys(groups).forEach(function (id) {
+      var group = groups[id];
+      // Hashing gives old/imported games a permanent partition as the replay grows.
+      var partition = group.partition || (seedNumber(String(seedNumber(seed)) + ':' + id) / 4294967296 < fraction ? 'heldout' : 'train');
+      group.samples.forEach(function (sample) { sample.partition = partition; });
+      if (partition === 'heldout') { heldout.push.apply(heldout, group.samples); heldoutGames.push(id); }
+      else { train.push.apply(train, group.samples); trainGames.push(id); }
+    });
+    return { train: train, heldout: heldout, trainGames: trainGames, heldoutGames: heldoutGames };
+  }
+
+  function evaluateLoss(model, samples) {
+    var previous = E.exportNetwork(), squared = 0, crossEntropy = 0;
+    try {
+      setModel(model);
+      samples.forEach(function (sample) {
+        if (!validSample(sample)) throw new Error('Invalid loss sample');
+        var predicted = probability(E.evaluate(new E.Position(sample.fen)));
+        if (!Number.isFinite(predicted)) throw new Error('Non-finite network evaluation');
+        var error = predicted - sample.target;
+        squared += error * error;
+        predicted = Math.max(1e-12, Math.min(1 - 1e-12, predicted));
+        crossEntropy -= sample.target * Math.log(predicted) + (1 - sample.target) * Math.log(1 - predicted);
+      });
+    } finally { setModel(previous); }
+    return { count: samples.length, mse: samples.length ? squared / samples.length : null, crossEntropy: samples.length ? crossEntropy / samples.length : null };
+  }
+
+  function relativeElo(score) {
+    // Endpoints have infinite Elo; use null so checkpoints remain valid JSON.
+    return score <= 0 || score >= 1 ? null : 400 * Math.log(score / (1 - score)) / Math.LN10;
+  }
+  function summarizeArena(results, opts) {
+    var cfg = options(opts), grouped = Object.create(null), wins = 0, draws = 0, losses = 0, truncated = 0;
+    results.forEach(function (game) {
+      var pair = grouped[game.pair] || (grouped[game.pair] = []);
+      pair.push(game);
+      if (game.truncated || game.score == null) truncated++;
+      else if (game.score === 1) wins++;
+      else if (game.score === 0) losses++;
+      else draws++;
+    });
+    var pairScores = [];
+    Object.keys(grouped).forEach(function (id) {
+      var pair = grouped[id];
+      if (pair.length === 2 && pair[0].candidateColor !== pair[1].candidateColor && pair.every(function (game) { return !game.truncated && Number.isFinite(game.score); }))
+        pairScores.push((pair[0].score + pair[1].score) / 2);
+    });
+    var mean = pairScores.length ? pairScores.reduce(function (sum, score) { return sum + score; }, 0) / pairScores.length : null;
+    var radius = pairScores.length ? Math.sqrt(Math.log(2 / (1 - cfg.confidence)) / (2 * pairScores.length)) : null;
+    var lower = mean == null ? null : Math.max(0, mean - radius);
+    var upper = mean == null ? null : Math.min(1, mean + radius);
+    var scoredGames = pairScores.length * 2;
+    var incompletePairs = Object.keys(grouped).length - pairScores.length;
+    // Censoring long games could preferentially hide losses. Complete-pair
+    // estimates remain useful diagnostics, but incomplete matches cannot promote.
+    var promoted = scoredGames >= cfg.minArenaGames && incompletePairs === 0 && lower > 0.5;
+    return {
+      attemptedGames: results.length, completedGames: wins + draws + losses, scoredGames: scoredGames,
+      completePairs: pairScores.length, incompletePairs: incompletePairs,
+      wins: wins, draws: draws, losses: losses, truncatedGames: truncated,
+      score: mean, confidence: cfg.confidence, scoreInterval: [lower, upper],
+      relativeElo: mean == null ? null : relativeElo(mean),
+      relativeEloInterval: [lower == null ? null : relativeElo(lower), upper == null ? null : relativeElo(upper)],
+      intervalMethod: 'paired Hoeffding bound', minGames: cfg.minArenaGames, promoted: promoted,
+      reason: promoted ? 'Candidate passed the paired confidence gate' : incompletePairs ? 'Arena contains incomplete pairs; increase maxPlies before promotion' : scoredGames < cfg.minArenaGames ? 'Insufficient completed paired games' : 'Confidence interval does not establish an improvement',
+      results: results
+    };
+  }
+
+  function runArena(candidate, champion, opts, onProgress) {
+    var cfg = options(opts), rng = createRNG(cfg.seed), results = [];
+    var previous = E.exportNetwork(), succeeded = false;
+    try {
+    var pairCount = Math.floor(cfg.arenaGames / 2), activeModel;
+    for (var pair = 0; pair < pairCount; pair++) {
+      var start = opening(rng, cfg, pair), firstColor = rng.next() < 0.5 ? E.WHITE : E.BLACK;
+      for (var colorGame = 0; colorGame < 2; colorGame++) {
+        var candidateColor = colorGame ? firstColor ^ E.BLACK : firstColor;
+        var pos = openingPosition(start), status = E.gameStatus(pos), ply = start.san.length;
+        E.clearTT(); activeModel = undefined;
+        while (!status.over && ply < cfg.maxPlies) {
+          var model = pos.side === candidateColor ? candidate : champion;
+          if (model !== activeModel) { setModel(model); activeModel = model; }
+          var search = E.think(pos, { moveTime: cfg.moveTime, maxDepth: cfg.maxDepth });
+          if (!search.best) throw new Error('Search did not return a legal arena move');
+          pos.makeMove(search.best); ply++;
+          status = E.gameStatus(pos);
+        }
+        var truncated = !status.over;
+        results.push({ pair: pair, opening: start, candidateColor: candidateColor, plies: ply, result: truncated ? null : status.result, score: truncated ? null : actualScore(status.result, candidateColor), reason: truncated ? 'ply-cap' : status.reason, truncated: truncated });
+        notify(onProgress, { phase: 'arena', game: results.length, games: pairCount * 2, result: results[results.length - 1].result, truncated: truncated });
+      }
+    }
+    var summary = summarizeArena(results, cfg);
+    succeeded = true;
+    return summary;
+    } finally { setModel(succeeded ? champion : previous); }
+  }
+
+  function normalizeReplay(replay) {
+    if (replay == null) return { version: VERSION, generation: 0, nextGameId: 0, samples: [], rngState: null };
+    if (Array.isArray(replay)) replay = { version: VERSION, generation: 0, nextGameId: replay.length, samples: replay, rngState: null };
+    if (replay.version !== VERSION || !Array.isArray(replay.samples)) throw new Error('Unsupported replay checkpoint');
+    if (!replay.samples.every(validSample)) throw new Error('Invalid replay checkpoint samples');
+    var generation = integer(replay.generation, 0, 0, Number.MAX_SAFE_INTEGER);
+    var nextGameId = integer(replay.nextGameId, replay.samples.length, 0, Number.MAX_SAFE_INTEGER);
+    replay.samples.forEach(function (sample) {
+      var match = /^g(\d+)-(\d+)$/.exec(sample.gameId);
+      if (match) { generation = Math.max(generation, Number(match[1])); nextGameId = Math.max(nextGameId, Number(match[2]) + 1); }
+    });
+    return { version: VERSION, generation: generation, nextGameId: nextGameId, samples: copy(replay.samples), rngState: replay.rngState == null ? null : integer(replay.rngState, 0, 0, 4294967295), trainingCandidate: copy(replay.trainingCandidate), trainingChampionSignature: typeof replay.trainingChampionSignature === 'string' ? replay.trainingChampionSignature : null };
+  }
+
+  function runGeneration(champion, replay, opts, onProgress) {
+    var cfg = options(opts), state = normalizeReplay(replay), started = Date.now();
+    var previous = E.exportNetwork(), succeeded = false, selected;
+    try {
+    cfg.generation = state.generation + 1;
+    cfg.nextGameId = state.nextGameId;
+    cfg.rngState = state.rngState;
+    champion = copy(champion);
+    var championSignature = modelSignature(champion);
+    var trainingResumed = !!state.trainingCandidate && state.trainingChampionSignature === championSignature;
+    var generated = generateSelfPlay(champion, cfg, onProgress);
+    var retained = state.samples.concat(generated.samples).slice(-cfg.maxReplay);
+    var split = splitByGame(retained, cfg.heldoutFraction, cfg.seed);
+    var candidate = null, metrics = null, arena;
+    var championTrain = evaluateLoss(champion, split.train), championHeldout = evaluateLoss(champion, split.heldout);
+    var candidateTrain = championTrain, candidateHeldout = championHeldout;
+    if (split.train.length) {
+      setModel(trainingResumed ? state.trainingCandidate : champion || E.createNetwork({ hidden: cfg.hidden, seed: (cfg.seed + cfg.generation) >>> 0 }));
+      notify(onProgress, { phase: 'training', samples: split.train.length, heldout: split.heldout.length, epochs: cfg.epochs });
+      metrics = E.trainNetwork(split.train, { epochs: cfg.epochs, learningRate: cfg.learningRate, seed: (cfg.seed + cfg.generation) >>> 0 });
+      candidate = E.exportNetwork();
+      candidateTrain = evaluateLoss(candidate, split.train);
+      candidateHeldout = evaluateLoss(candidate, split.heldout);
+      notify(onProgress, { phase: 'evaluation', train: candidateTrain, heldout: candidateHeldout });
+      // Keep arena sampling independent of the self-play stream and reproducible.
+      var arenaOpts = Object.assign({}, cfg, { seed: seedNumber(cfg.seed + ':arena:' + cfg.generation) });
+      arena = runArena(candidate, champion, arenaOpts, onProgress);
+    } else {
+      arena = summarizeArena([], cfg);
+      arena.reason = 'No eligible training positions were generated';
+    }
+    var promoted = !!candidate && arena.promoted;
+    selected = promoted ? candidate : champion;
+    setModel(selected);
+    var report = {
+      version: VERSION, generation: cfg.generation, seed: cfg.seed,
+      durationMs: Date.now() - started, promoted: promoted,
+      options: cfg,
+      selfPlay: { games: generated.games, completedGames: generated.games.filter(function (game) { return !game.truncated; }).length, truncatedGames: generated.games.filter(function (game) { return game.truncated; }).length, samples: generated.samples.length },
+      replay: { samples: retained.length, trainSamples: split.train.length, heldoutSamples: split.heldout.length, trainGames: split.trainGames.length, heldoutGames: split.heldoutGames.length },
+      losses: { championTrain: championTrain, championHeldout: championHeldout, candidateTrain: candidateTrain, candidateHeldout: candidateHeldout },
+      training: metrics, trainingResumed: trainingResumed, arena: arena,
+      policy: 'Promote only after at least ' + cfg.minArenaGames + ' completed paired-color games, no incomplete pairs, and a paired confidence lower bound above 0.5; Elo is relative to this champion at this search budget.'
+    };
+    notify(onProgress, { phase: 'complete', generation: cfg.generation, promoted: promoted, reason: arena.reason });
+    succeeded = true;
+    return { candidate: candidate, champion: copy(selected), promoted: promoted, replay: { version: VERSION, generation: cfg.generation, nextGameId: generated.nextGameId, samples: retained, rngState: generated.rngState, trainingCandidate: promoted ? null : candidate || (trainingResumed ? state.trainingCandidate : null), trainingChampionSignature: promoted ? null : championSignature }, report: report };
+    } finally { setModel(succeeded ? selected : previous); }
+  }
+
+  return {
+    version: VERSION, scoreScale: SCORE_SCALE, promotionMinGames: PROMOTION_MIN_GAMES,
+    createRNG: createRNG, probability: probability, defaults: options,
+    generateSelfPlay: generateSelfPlay, splitByGame: splitByGame,
+    evaluateLoss: evaluateLoss, runArena: runArena, summarizeArena: summarizeArena,
+    normalizeReplay: normalizeReplay, runGeneration: runGeneration
+  };
+}
+
 ChessCore();
+// END GENERATED ENGINE
 </script>
 
 <script>
@@ -1770,18 +2410,22 @@ var pendingPromo = null;
 var gameOver = false;
 var watchdog = null;
 var workerProbe = null;
+var pendingNetwork;
+var searchId = 0;
 
 var GLYPH = {1:'\u265F',2:'\u265E',3:'\u265D',4:'\u265C',5:'\u265B',6:'\u265A'};
 var LEVEL_NAMES = [null,'Skittles','Club','Expert','Master','Arbiter'];
 
 /* ---------- worker ---------- */
 var worker = null;
+function startWorker(){
 try {
   var src = '(' + ChessCore.toString() + ')();\n' +
     'var A=self.ChessAPI;' +
     'self.onmessage=function(e){' +
     ' var d=e.data;' +
     ' if(d.cmd==="ping"){self.postMessage({type:"pong"});return;}' +
+    ' if(d.cmd==="model"){A.loadNetwork(d.model);return;}' +
     ' if(d.cmd!=="go")return;' +
     ' var p=new A.Position(d.fen);' +
     ' for(var i=0;i<d.moves.length;i++){' +
@@ -1791,23 +2435,36 @@ try {
     '   }' +
     ' }' +
     ' var res=A.chooseMove(p,d.level,function(info){' +
-    '   self.postMessage({type:"info",depth:info.depth,score:info.score,nodes:info.nodes,time:info.time,pv:pvSan(p,info.pv)});' +
+    '   self.postMessage({type:"info",id:d.id,depth:info.depth,score:info.score,nodes:info.nodes,time:info.time,pv:pvSan(p,info.pv)});' +
     ' });' +
-    ' self.postMessage({type:"result",f:A.mFrom(res.best),t:A.mTo(res.best),p:A.mPromo(res.best),' +
+    ' self.postMessage({type:"result",id:d.id,f:A.mFrom(res.best),t:A.mTo(res.best),p:A.mPromo(res.best),' +
     '   score:res.score,depth:res.depth,nodes:res.nodes,time:res.time,book:!!res.book});' +
     '};' +
     'function pvSan(p,pv){var out=[],n=0;for(var i=0;i<pv.length;i++){var ok=false,ms=p.legalMoves();' +
     ' for(var j=0;j<ms.length;j++)if(ms[j]===pv[i]){ok=true;break;}' +
     ' if(!ok)break;out.push(A.toSAN(p,pv[i]));p.makeMove(pv[i]);n++;}' +
     ' while(n-->0)p.unmakeMove();return out;}';
-  worker = new Worker(URL.createObjectURL(new Blob([src],{type:'text/javascript'})));
-  worker.onmessage = onEngineMessage;
-  worker.onerror = function(){ worker = null; };
+  var url = URL.createObjectURL(new Blob([src],{type:'text/javascript'}));
+  var playingWorker = new Worker(url);
+  URL.revokeObjectURL(url);
+  worker = playingWorker;
+  worker.onmessage = function(event){ if(worker === playingWorker) onEngineMessage(event); };
+  worker.onerror = function(){ if(worker === playingWorker){ worker.terminate(); worker = null; } };
   // a blob worker is blocked when the page is opened straight off the filesystem,
   // so prove it replies before trusting it with a search
-  workerProbe = setTimeout(function(){ worker = null; }, 2500);
+  workerProbe = setTimeout(function(){ if(worker === playingWorker){ worker.terminate(); worker = null; } }, 2500);
   worker.postMessage({ cmd:'ping' });
+  worker.postMessage({ cmd:'model', model:API.exportNetwork() });
 } catch(e){ worker = null; }
+}
+startWorker();
+
+function setNetwork(model){
+  if(thinking){ pendingNetwork = model; return; }
+  API.loadNetwork(model);
+  if(worker) worker.postMessage({cmd:'model',model:model});
+}
+self.ArbiterUI = { setNetwork:setNetwork };
 
 /* ---------- audio ---------- */
 var actx = null;
@@ -2044,34 +2701,37 @@ function applyMove(m){
 
 /* ---------- engine ---------- */
 function engineTurn(){
-  if(gameOver || pos.side === humanColor) return;
+  if(thinking || gameOver || pos.side === humanColor) return;
   var st = API.gameStatus(pos);
   if(st.over){ render(); return; }
   thinking = true;
   updateTurnDots();
   $('tLine').textContent = 'Arbiter is calculating…';
 
-  var payload = { cmd:'go', fen:startFen, moves:moveLog.map(function(x){ return {f:x.f,t:x.t,p:x.p}; }), level:level };
+  var id = ++searchId;
+  var payload = { cmd:'go', id:id, fen:startFen, moves:moveLog.map(function(x){ return {f:x.f,t:x.t,p:x.p}; }), level:level };
   if(worker){
     worker.postMessage(payload);
     clearTimeout(watchdog);
     watchdog = setTimeout(function(){
-      if(!thinking) return;
-      worker = null;            // background thread never answered — run it here instead
-      runLocal();
+      if(!thinking || id !== searchId) return;
+      if(worker) worker.terminate();
+      worker = null;
+      runLocal(id);
     }, (API.LEVELS[level].time || 6000) + 6000);
   } else {
-    runLocal();
+    runLocal(id);
   }
 }
 
-function runLocal(){
+function runLocal(id){
   setTimeout(function(){
+    if(!thinking || id !== searchId) return;
     var res = API.chooseMove(pos, level, function(info){
       showInfo(info.depth, info.score, info.nodes, info.time, null);
     });
     if(!res.best) return;
-    onEngineMessage({ data:{ type:'result', f:API.mFrom(res.best), t:API.mTo(res.best), p:API.mPromo(res.best),
+    onEngineMessage({ data:{ type:'result', id:id, f:API.mFrom(res.best), t:API.mTo(res.best), p:API.mPromo(res.best),
       score:res.score, depth:res.depth, nodes:res.nodes, time:res.time, book:!!res.book } });
   }, 30);
 }
@@ -2089,10 +2749,12 @@ function showInfo(depth, score, nodes, time, pv){
 function onEngineMessage(e){
   var d = e.data;
   if(d.type === 'pong'){ clearTimeout(workerProbe); return; }
+  if(!thinking || d.id !== searchId) return;
   if(d.type === 'info'){ showInfo(d.depth, d.score, d.nodes, d.time, d.pv); return; }
   if(d.type !== 'result') return;
   clearTimeout(watchdog);
   thinking = false;
+  if(pendingNetwork !== undefined){ var model = pendingNetwork; pendingNetwork = undefined; setNetwork(model); }
   if(!d.book) showInfo(d.depth, d.score, d.nodes, d.time, null);
 
   var moves = pos.legalMoves(), chosen = null;
@@ -2115,6 +2777,13 @@ function onEngineMessage(e){
 
 /* ---------- controls ---------- */
 function newGame(side){
+  var restart = thinking && worker;
+  searchId++;
+  clearTimeout(watchdog);
+  thinking = false;
+  if(restart){ worker.terminate(); worker = null; clearTimeout(workerProbe); }
+  if(pendingNetwork !== undefined){ var model = pendingNetwork; pendingNetwork = undefined; setNetwork(model); }
+  if(restart) startWorker();
   if(side === 'r') side = Math.random() < .5 ? 'w' : 'b';
   humanColor = side === 'b' ? BLACK : WHITE;
   flipped = humanColor === BLACK;
@@ -2234,6 +2903,169 @@ render();
 sizePieces();
 $('tLine').textContent = 'You are White. Tap a piece to begin.';
 })();
+</script>
+<script>
+// BEGIN GENERATED TRAINING UI
+/* Self-play lab. Embedded by tools/sync-browser.js for offline use. */
+(function () {
+  'use strict';
+  var E = self.ChessAPI;
+  var storageKey = 'arbiter.learning.v1';
+  var state = { format: 'arbiter-training', version: 1, generation: 0, champion: null, replay: null };
+  var trainingWorker = null;
+  var lastCandidate = null;
+  var storageWarning = '';
+  var style = document.createElement('style');
+  style.textContent = '#learnLab{padding:12px;background:var(--panel);margin-top:14px;border:1px solid var(--line)}' +
+    '#learnLab h2{margin:0 0 8px;font-size:14px;color:var(--chalk)}#learnLab p{font-size:11px;color:var(--ink-dim)}' +
+    '#learnLab .actions{display:flex;flex-wrap:wrap;gap:6px}#learnLab button{font:inherit;font-size:11px;padding:8px;background:var(--panel-2);color:var(--ink);border:1px solid var(--line);cursor:pointer}' +
+    '#learnLab button:disabled{opacity:.45;cursor:default}#learnStatus{white-space:pre-wrap;overflow-wrap:anywhere}';
+  document.head.appendChild(style);
+  var panel = document.createElement('section');
+  panel.id = 'learnLab';
+  panel.setAttribute('aria-label', 'Self-training lab');
+  panel.innerHTML = '<h2>Self-training lab</h2>' +
+    '<p>Arbiter plays itself, learns a neural evaluation, then tests it against its current champion. Only a candidate with convincing match results becomes the playing model.</p>' +
+    '<p id="learnStatus" role="status" aria-live="polite"></p>' +
+    '<div class="actions"><button id="learnStart">Start training</button><button id="learnStop" disabled>Stop</button>' +
+    '<button id="learnExport">Export checkpoint</button><button id="learnCandidate" disabled>Export candidate</button>' +
+    '<button id="learnImport">Import model / checkpoint</button><button id="learnReset">Reset learning</button></div>' +
+    '<input id="learnFile" type="file" accept=".json,application/json" hidden>' +
+    '<p>Training runs on this device and uses CPU and battery. Completed generations save locally. 3000+ Elo is a goal; this version has no verified rating.</p>';
+  document.querySelector('.wrap').appendChild(panel);
+  function el(id) { return document.getElementById(id); }
+  function status(message) { el('learnStatus').textContent = message + (storageWarning ? '\n' + storageWarning : ''); }
+  function progressText(progress) {
+    if (progress.phase === 'selfplay') return 'Self-play game ' + progress.game + '/' + progress.games + ' · ply ' + progress.ply + ' · ' + progress.samples + ' sampled positions';
+    if (progress.phase === 'training') return 'Learning from ' + progress.samples + ' positions · ' + progress.epochs + ' passes';
+    if (progress.phase === 'evaluation') return 'Checking held-out predictions' + (progress.heldout && progress.heldout.mse !== null ? ' · error ' + progress.heldout.mse.toFixed(5) : '');
+    if (progress.phase === 'arena') return 'Candidate match ' + progress.game + '/' + progress.games + ' · ' + (progress.truncated ? 'unfinished at move cap' : progress.result);
+    return progress.reason || 'Saving generation…';
+  }
+  function apply() { self.ArbiterUI.setNetwork(state.champion); }
+  function save() {
+    try { localStorage.setItem(storageKey, JSON.stringify(state)); storageWarning = ''; }
+    catch (error) { storageWarning = 'Local saving unavailable or full. Export a checkpoint to keep progress.'; }
+  }
+  function validateCheckpoint(value) {
+    if (!value || value.format !== 'arbiter-training' || value.version !== 1 || !Number.isInteger(value.generation) || value.generation < 0 || !('champion' in value)) throw new Error('Unsupported checkpoint');
+    // Validate independently, without replacing the playing model on failure.
+    var scope = {};
+    ChessCore(scope);
+    scope.ChessAPI.loadNetwork(value.champion);
+    if (value.replay && value.replay.samples && value.replay.samples.length > 20000) throw new Error('Checkpoint replay exceeds the browser limit of 20,000 positions');
+    return value;
+  }
+  try {
+    var saved = localStorage.getItem(storageKey);
+    if (saved) { state = validateCheckpoint(JSON.parse(saved)); apply(); }
+  } catch (error) { storageWarning = 'Saved learning could not be loaded: ' + error.message; }
+  status('Generation ' + state.generation + ' · ' + (state.champion ? 'neural champion loaded' : 'classical champion') + ' · ready');
+
+  function workerMain() {
+    var A = self.ChessAPI;
+    var learner = LearningCore(A);
+    var current;
+    function next() {
+      try {
+        var result = learner.runGeneration(current.champion, current.replay, {
+          selfPlayGames: 8, arenaGames: 40, moveTime: 10, maxDepth: 3, maxPlies: 240,
+          epochs: 4, learningRate: 0.01, maxReplay: 2000, seed: 1,
+          generation: current.generation + 1
+        }, function (progress) { self.postMessage({ type: 'progress', progress: progress }); });
+        current = { format: 'arbiter-training', version: 1, generation: current.generation + 1,
+          champion: result.champion, replay: result.replay, report: result.report };
+        self.postMessage({ type: 'generation', state: current, candidate: result.candidate, promoted: result.promoted });
+        setTimeout(next, 20);
+      } catch (error) { self.postMessage({ type: 'error', message: error.message }); }
+    }
+    self.onmessage = function (event) { current = event.data.state; next(); };
+  }
+  function controls(running) {
+    el('learnStart').disabled = running;
+    el('learnStop').disabled = !running;
+    el('learnImport').disabled = running;
+    el('learnReset').disabled = running;
+  }
+  el('learnStart').onclick = function () {
+    if (trainingWorker) return;
+    var url;
+    try {
+      var source = '(' + ChessCore.toString() + ')();\n' + LearningCore.toString() + '\n(' + workerMain.toString() + ')();';
+      url = URL.createObjectURL(new Blob([source], { type: 'text/javascript' }));
+      trainingWorker = new Worker(url);
+      URL.revokeObjectURL(url);
+      controls(true);
+      status('Generation ' + (state.generation + 1) + ' · generating self-play games…');
+      trainingWorker.onmessage = function (event) {
+        var data = event.data;
+        if (data.type === 'progress') {
+          status('Generation ' + (state.generation + 1) + ' · ' + progressText(data.progress));
+        } else if (data.type === 'generation') {
+          state = data.state;
+          lastCandidate = data.candidate;
+          el('learnCandidate').disabled = false;
+          save(); apply();
+          status('Generation ' + state.generation + ' saved · ' + (data.promoted ? 'new champion promoted' : 'champion retained') + '\nNext generation starting…');
+        } else if (data.type === 'error') stop('Training failed: ' + data.message);
+      };
+      trainingWorker.onerror = function (event) { stop('Training failed: ' + (event.message || 'worker unavailable')); };
+      trainingWorker.postMessage({ state: state });
+    } catch (error) {
+      if (url) URL.revokeObjectURL(url);
+      stop('Training needs browser Web Worker support: ' + error.message);
+    }
+  };
+  function stop(message) {
+    if (trainingWorker) trainingWorker.terminate();
+    trainingWorker = null;
+    controls(false);
+    status(message || 'Stopped. Generation ' + state.generation + ' kept; the unfinished generation was discarded.');
+  }
+  el('learnStop').onclick = function () { stop(); };
+  function download(value, name) {
+    var url = URL.createObjectURL(new Blob([JSON.stringify(value)], { type: 'application/json' }));
+    var link = document.createElement('a');
+    link.href = url; link.download = name; link.click();
+    setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+  }
+  el('learnExport').onclick = function () { download(state, 'arbiter-checkpoint.json'); };
+  el('learnCandidate').onclick = function () { if (lastCandidate) download(lastCandidate, 'arbiter-candidate.json'); };
+  el('learnImport').onclick = function () { el('learnFile').click(); };
+  el('learnFile').onchange = function () {
+    var file = this.files[0];
+    this.value = '';
+    if (!file) return;
+    if (file.size > 20 * 1024 * 1024) { status('Import failed: file exceeds 20 MB'); return; }
+    var reader = new FileReader();
+    reader.onload = function () {
+      try {
+        var value = JSON.parse(reader.result);
+        if (value && value.format === 'arbiter-training') state = validateCheckpoint(value);
+        else {
+          // Preserve the existing model if validation throws.
+          var scope = {}; ChessCore(scope); scope.ChessAPI.loadNetwork(value);
+          state = { format: 'arbiter-training', version: 1, generation: 0, champion: scope.ChessAPI.exportNetwork(), replay: null };
+        }
+        lastCandidate = null;
+        el('learnCandidate').disabled = true;
+        save(); apply();
+        status('Imported generation ' + state.generation + '. Imported models are user-selected and have not passed this device’s arena.');
+      } catch (error) { status('Import failed: ' + error.message); }
+    };
+    reader.onerror = function () { status('Import failed: file could not be read'); };
+    reader.readAsText(file);
+  };
+  el('learnReset').onclick = function () {
+    state = { format: 'arbiter-training', version: 1, generation: 0, champion: null, replay: null };
+    lastCandidate = null;
+    el('learnCandidate').disabled = true;
+    save(); apply();
+    status('Learning reset. Classical champion restored.');
+  };
+})();
+
+// END GENERATED TRAINING UI
 </script>
 </body>
 </html>
